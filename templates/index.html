@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Volleyball Spike Analyzer</title>
+
+<!--
+  ==========================================================================
+  STYLES
+  Dark-theme, responsive layout: a camera viewport with a canvas overlay
+  for the MediaPipe skeleton, plus a HUD panel showing live joint angles
+  and the server-side SVM classification result.
+  ==========================================================================
+-->
+<style>
+  :root {
+    --bg-dark: #0b0f14;
+    --panel-bg: #12181f;
+    --panel-border: #223041;
+    --accent-blue: #3ea6ff;
+    --neon-green: #39ff88;
+    --alert-orange: #ff8a3d;
+    --alert-red: #ff4d4d;
+    --text-primary: #eaf2f8;
+    --text-secondary: #8ea0b3;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: radial-gradient(circle at 50% 0%, #16202b 0%, var(--bg-dark) 60%);
+    color: var(--text-primary);
+    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+  }
+
+  .app-shell {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px 16px 48px;
+  }
+
+  header.app-header {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+
+  header.app-header h1 {
+    font-size: clamp(1.6rem, 3vw, 2.4rem);
+    margin: 0 0 6px;
+    background: linear-gradient(90deg, var(--accent-blue), var(--neon-green));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    letter-spacing: 0.5px;
+  }
+
+  header.app-header p {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+  }
+
+  .main-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(280px, 1fr);
+    gap: 20px;
+  }
+
+  @media (max-width: 860px) {
+    .main-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  /* ---------------- Camera viewport ---------------- */
+  .viewport-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 16px;
+    padding: 14px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    transition: box-shadow 0.25s ease, border-color 0.25s ease;
+  }
+
+  .viewport-card.flash-good {
+    border-color: var(--neon-green);
+    box-shadow: 0 0 24px rgba(57, 255, 136, 0.55), 0 8px 30px rgba(0, 0, 0, 0.35);
+  }
+
+  .viewport-card.flash-bad {
+    border-color: var(--alert-orange);
+    box-shadow: 0 0 24px rgba(255, 138, 61, 0.55), 0 8px 30px rgba(0, 0, 0, 0.35);
+  }
+
+  .camera-wrapper {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  /* Both the video and the canvas are mirrored identically via CSS so
+     the skeleton overlay stays perfectly aligned with the mirrored
+     "selfie view" video, without needing to flip coordinates in JS. */
+  #input-video,
+  #overlay-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    transform: scaleX(-1);
+  }
+
+  #input-video {
+    object-fit: cover;
+  }
+
+  .viewport-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+
+  button#start-btn {
+    background: linear-gradient(135deg, var(--accent-blue), #1c7ed6);
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 10px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.15s ease, opacity 0.15s ease;
+  }
+
+  button#start-btn:hover {
+    transform: translateY(-1px);
+  }
+
+  button#start-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .status-badge {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #555;
+    display: inline-block;
+  }
+
+  .status-dot.live {
+    background: var(--neon-green);
+    box-shadow: 0 0 8px var(--neon-green);
+  }
+
+  /* ---------------- HUD panel ---------------- */
+  .hud-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 16px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  }
+
+  .hud-section h3 {
+    margin: 0 0 10px;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--text-secondary);
+  }
+
+  .angle-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 10px 14px;
+    background: #0e1420;
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    margin-bottom: 8px;
+  }
+
+  .angle-row .label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+  }
+
+  .angle-row .value {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: var(--accent-blue);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------------- SVM verdict panel ---------------- */
+  #verdict-panel {
+    border-radius: 12px;
+    padding: 16px;
+    text-align: center;
+    border: 1px solid var(--panel-border);
+    background: #0e1420;
+    transition: background 0.25s ease, border-color 0.25s ease;
+  }
+
+  #verdict-panel.good {
+    background: rgba(57, 255, 136, 0.12);
+    border-color: var(--neon-green);
+  }
+
+  #verdict-panel.bad {
+    background: rgba(255, 138, 61, 0.12);
+    border-color: var(--alert-orange);
+  }
+
+  #verdict-label {
+    font-size: 1.15rem;
+    font-weight: 700;
+    margin-bottom: 6px;
+  }
+
+  #verdict-label.good-text {
+    color: var(--neon-green);
+  }
+
+  #verdict-label.bad-text {
+    color: var(--alert-orange);
+  }
+
+  #verdict-feedback {
+    font-size: 0.88rem;
+    color: var(--text-primary);
+    line-height: 1.4;
+  }
+
+  .hud-footer {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-align: center;
+    line-height: 1.5;
+  }
+
+  .hint-banner {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    background: #0e1420;
+    border: 1px dashed var(--panel-border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div class="app-shell">
+  <header class="app-header">
+    <h1>🏐 Volleyball Spike Analyzer</h1>
+    <p>Client-side MediaPipe pose tracking + server-side SVM spike-form classification</p>
+  </header>
+
+  <div class="main-grid">
+    <!-- ============================== CAMERA VIEWPORT ============================== -->
+    <section class="viewport-card" id="viewport-card">
+      <div class="camera-wrapper">
+        <video id="input-video" autoplay playsinline muted></video>
+        <canvas id="overlay-canvas"></canvas>
+      </div>
+
+      <div class="viewport-controls">
+        <button id="start-btn">▶ Start Camera</button>
+        <div class="status-badge">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Camera off</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== HUD PANEL ============================== -->
+    <aside class="hud-card">
+      <div class="hud-section">
+        <h3>Live Joint Angles</h3>
+        <div class="angle-row">
+          <span class="label">Right Elbow</span>
+          <span class="value"><span id="elbow-angle">--</span>&deg;</span>
+        </div>
+        <div class="angle-row">
+          <span class="label">Right Knee</span>
+          <span class="value"><span id="knee-angle">--</span>&deg;</span>
+        </div>
+      </div>
+
+      <div class="hud-section">
+        <h3>SVM Form Classification</h3>
+        <div id="verdict-panel">
+          <div id="verdict-label">Waiting for pose data...</div>
+          <div id="verdict-feedback">Stand back so your full right arm and leg are visible.</div>
+        </div>
+      </div>
+
+      <div class="hint-banner">
+        Position yourself side-on to the camera so your right shoulder, elbow,
+        wrist, hip, knee and ankle are all clearly visible.
+      </div>
+
+      <div class="hud-footer">
+        Pose detection runs 100% in your browser (MediaPipe, modelComplexity 0).<br />
+        Only two numbers (elbow &amp; knee angle) are sent to the server per prediction.
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!--
+  ==========================================================================
+  MEDIAPIPE CDN IMPORTS
+  Loaded from the official jsdelivr CDN as required. camera_utils handles
+  pulling frames from the <video> element into the Pose model; drawing_utils
+  gives us drawConnectors/drawLandmarks helpers for the skeleton overlay.
+  ==========================================================================
+-->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+<script>
+(() => {
+  "use strict";
+
+  // ------------------------------------------------------------------
+  // DOM references
+  // ------------------------------------------------------------------
+  const videoElement = document.getElementById("input-video");
+  const canvasElement = document.getElementById("overlay-canvas");
+  const canvasCtx = canvasElement.getContext("2d");
+
+  const startBtn = document.getElementById("start-btn");
+  const statusDot = document.getElementById("status-dot");
+  const statusText = document.getElementById("status-text");
+
+  const elbowAngleEl = document.getElementById("elbow-angle");
+  const kneeAngleEl = document.getElementById("knee-angle");
+
+  const viewportCard = document.getElementById("viewport-card");
+  const verdictPanel = document.getElementById("verdict-panel");
+  const verdictLabelEl = document.getElementById("verdict-label");
+  const verdictFeedbackEl = document.getElementById("verdict-feedback");
+
+  // ------------------------------------------------------------------
+  // Constants / state
+  // ------------------------------------------------------------------
+  // MediaPipe Pose landmark indices we care about (BlazePose topology).
+  const LM = {
+    RIGHT_SHOULDER: 12,
+    RIGHT_ELBOW: 14,
+    RIGHT_WRIST: 16,
+    RIGHT_HIP: 24,
+    RIGHT_KNEE: 26,
+    RIGHT_ANKLE: 28,
+  };
+
+  // Only send one out of every PREDICT_EVERY_N_FRAMES frames to the backend
+  // to avoid spamming the network while still feeling near-instant.
+  const PREDICT_EVERY_N_FRAMES = 4;
+  let frameCounter = 0;
+
+  // Guards against overlapping fetch() calls if the network is slow.
+  let predictionInFlight = false;
+
+  // Flash animation timeout handle so overlapping flashes don't stack.
+  let flashTimeoutHandle = null;
+
+  // ------------------------------------------------------------------
+  // Geometry helpers
+  // ------------------------------------------------------------------
+  /**
+   * Computes the angle ABC (in degrees) at vertex B, given three
+   * MediaPipe landmarks with normalized {x, y, z} coordinates.
+   * Uses full 3D vectors (x, y, z) for a more robust angle estimate
+   * than a pure 2D calculation.
+   */
+  function calculateAngle(a, b, c) {
+    const baX = a.x - b.x, baY = a.y - b.y, baZ = (a.z || 0) - (b.z || 0);
+    const bcX = c.x - b.x, bcY = c.y - b.y, bcZ = (c.z || 0) - (b.z || 0);
+
+    const dot = baX * bcX + baY * bcY + baZ * bcZ;
+    const magBA = Math.hypot(baX, baY, baZ);
+    const magBC = Math.hypot(bcX, bcY, bcZ);
+
+    if (magBA === 0 || magBC === 0) return null;
+
+    // Clamp to [-1, 1] to guard against floating point drift pushing the
+    // cosine value slightly out of its valid domain (causes NaN in acos).
+    const cosAngle = Math.min(1, Math.max(-1, dot / (magBA * magBC)));
+    const angleRad = Math.acos(cosAngle);
+    return angleRad * (180 / Math.PI);
+  }
+
+  // ------------------------------------------------------------------
+  // Backend communication
+  // ------------------------------------------------------------------
+  async function sendPredictionRequest(elbowAngle, kneeAngle) {
+    if (predictionInFlight) return;
+    predictionInFlight = true;
+
+    try {
+      const response = await fetch("/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ elbow_angle: elbowAngle, knee_angle: kneeAngle }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server responded with status ${response.status}`);
+      }
+
+      const result = await response.json();
+      updateVerdictUI(result.form_label, result.feedback);
+    } catch (err) {
+      // Network hiccups shouldn't crash the render loop; just log it.
+      console.warn("Prediction request failed:", err);
+    } finally {
+      predictionInFlight = false;
+    }
+  }
+
+  /**
+   * Updates the HUD verdict panel and triggers a full-viewport flash
+   * (neon green for good form, orange for adjustment needed).
+   */
+  function updateVerdictUI(formLabel, feedback) {
+    const isGood = formLabel === 1;
+
+    verdictPanel.classList.remove("good", "bad");
+    verdictLabelEl.classList.remove("good-text", "bad-text");
+
+    if (isGood) {
+      verdictPanel.classList.add("good");
+      verdictLabelEl.classList.add("good-text");
+      verdictLabelEl.textContent = "✔ Good Spike Form";
+    } else {
+      verdictPanel.classList.add("bad");
+      verdictLabelEl.classList.add("bad-text");
+      verdictLabelEl.textContent = "⚠ Needs Adjustment";
+    }
+    verdictFeedbackEl.textContent = feedback;
+
+    // Flash the camera viewport border/glow briefly for extra visual punch.
+    viewportCard.classList.remove("flash-good", "flash-bad");
+    // Force reflow so the class removal/addition re-triggers the transition
+    // even if the same class is applied again back-to-back.
+    void viewportCard.offsetWidth;
+    viewportCard.classList.add(isGood ? "flash-good" : "flash-bad");
+
+    if (flashTimeoutHandle) clearTimeout(flashTimeoutHandle);
+    flashTimeoutHandle = setTimeout(() => {
+      viewportCard.classList.remove("flash-good", "flash-bad");
+    }, 900);
+  }
+
+  // ------------------------------------------------------------------
+  // MediaPipe Pose setup
+  // ------------------------------------------------------------------
+  const pose = new Pose({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
+  });
+
+  pose.setOptions({
+    modelComplexity: 0,        // Lightest/fastest model -> keeps low-end Chromebooks at 30+ FPS
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    smoothSegmentation: false,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6,
+  });
+
+  pose.onResults(onPoseResults);
+
+  /**
+   * Called by MediaPipe for every processed frame. Draws the skeleton
+   * overlay, computes joint angles, updates the HUD, and (throttled)
+   * sends the feature vector to the backend for classification.
+   */
+  function onPoseResults(results) {
+    // Keep the canvas resolution in sync with the incoming video frame.
+    canvasElement.width = results.image.width;
+    canvasElement.height = results.image.height;
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    if (results.poseLandmarks) {
+      // Draw the full skeleton + landmark dots.
+      drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, {
+        color: "#3ea6ff",
+        lineWidth: 3,
+      });
+      drawLandmarks(canvasCtx, results.poseLandmarks, {
+        color: "#39ff88",
+        lineWidth: 1,
+        radius: 3,
+      });
+
+      const lm = results.poseLandmarks;
+      const shoulder = lm[LM.RIGHT_SHOULDER];
+      const elbow = lm[LM.RIGHT_ELBOW];
+      const wrist = lm[LM.RIGHT_WRIST];
+      const hip = lm[LM.RIGHT_HIP];
+      const knee = lm[LM.RIGHT_KNEE];
+      const ankle = lm[LM.RIGHT_ANKLE];
+
+      const elbowAngle = calculateAngle(shoulder, elbow, wrist);
+      const kneeAngle = calculateAngle(hip, knee, ankle);
+
+      if (elbowAngle !== null) elbowAngleEl.textContent = elbowAngle.toFixed(1);
+      if (kneeAngle !== null) kneeAngleEl.textContent = kneeAngle.toFixed(1);
+
+      // Throttle network requests: only send once every N frames.
+      frameCounter += 1;
+      if (
+        elbowAngle !== null &&
+        kneeAngle !== null &&
+        frameCounter % PREDICT_EVERY_N_FRAMES === 0
+      ) {
+        sendPredictionRequest(elbowAngle, kneeAngle);
+      }
+    }
+
+    canvasCtx.restore();
+  }
+
+  // ------------------------------------------------------------------
+  // Camera bootstrap
+  // ------------------------------------------------------------------
+  let cameraController = null;
+
+  async function startCamera() {
+    startBtn.disabled = true;
+    startBtn.textContent = "Starting...";
+
+    try {
+      cameraController = new Camera(videoElement, {
+        onFrame: async () => {
+          await pose.send({ image: videoElement });
+        },
+        width: 640,
+        height: 480,
+      });
+
+      await cameraController.start();
+
+      statusDot.classList.add("live");
+      statusText.textContent = "Camera live";
+      startBtn.textContent = "● Camera Running";
+    } catch (err) {
+      console.error("Failed to start camera:", err);
+      statusText.textContent = "Camera access denied";
+      startBtn.disabled = false;
+      startBtn.textContent = "▶ Start Camera";
+      alert(
+        "Could not access the camera. Please grant camera permission " +
+          "and make sure you're on HTTPS (or localhost), then try again."
+      );
+    }
+  }
+
+  startBtn.addEventListener("click", startCamera);
+})();
+</script>
+
+</body>
+</html>
